@@ -232,27 +232,6 @@ int evalNumChannels(const unsigned char* data, const int numPixels)
     return numChannels;
 }
 
-void compressImageData(const int width, const int height, const int channel, unsigned char* rawData, std::vector<unsigned char>& data)
-{
-    data.resize(width * height * channel);
-    for (int xy = 0; xy < width * height; xy++) {
-        if (channel > 0) {
-            data[xy * channel + 0] = rawData[xy * 4 + 0];
-        }
-        if (channel == 2) {
-            data[xy * channel + 1] = rawData[xy * 4 + 3];
-        } else if (channel > 1) {
-            data[xy * channel + 1] = rawData[xy * 4 + 1];
-        }
-        if (channel > 2) {
-            data[xy * channel + 2] = rawData[xy * 4 + 2];
-        }
-        if (channel > 3) {
-            data[xy * channel + 3] = rawData[xy * 4 + 3];
-        }
-    }
-}
-
 V2i pyramidLevelSize(const V2i& sizeBase, const int level)
 {
     return V2i(V2f(sizeBase) * std::pow(2.0f, -float(level)));
@@ -276,9 +255,9 @@ int main(int argc, char** argv)
         printf("usage: %s [options]\n", argv[0]);
         printf("\n");
         printf("options:\n");
-        printf("  -albedo <albedo.png>\n");
+        printf("  -svbrdf_dir <directory>\n");
+        printf("  -output_dir <directory>\n");
         printf("  -mask <mask.png>\n");
-        printf("  -output <output.png>\n");
         printf("  -weight <value>\n");
         printf("  -uniformity <value>\n");
         printf("  -patchsize <size>\n");
@@ -292,12 +271,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::string albedoFileName = "albedo.png";
-    std::string maskFileName   = "bmask0.png";
-    std::string outputFileName;
+    struct Image {
+        int            width;
+        int            height;
+        int            channels;
+        unsigned char* data;
+    };
 
-    float albedoWeight = -1;
-    float maskWeight   = -1;
+    std::vector<Image> svbrdfs;
+    std::string        svbrdf_dir;
+    std::string        output_dir;
+    std::string        albedoFileName;
+    std::string        normalFileName;
+    std::string        roughnessFileName;
+    std::string        maskFileName;
 
     float uniformityWeight   = 3500;
     int   patchSize          = 5;
@@ -321,13 +308,11 @@ int main(int argc, char** argv)
             float       weight;
             std::string backendName;
 
-            if (tryToParseStringArg(args, &argi, "-albedo", &albedoFileName, &fail)) {
-                albedoWeight = -1;
+            if (tryToParseStringArg(args, &argi, "-svbrdf_dir", &svbrdf_dir, &fail)) {
+                argi++;
+            } else if (tryToParseStringArg(args, &argi, "-output_dir", &output_dir, &fail)) {
                 argi++;
             } else if (tryToParseStringArg(args, &argi, "-mask", &maskFileName, &fail)) {
-                maskWeight = -1;
-                argi++;
-            } else if (tryToParseStringArg(args, &argi, "-output", &outputFileName, &fail)) {
                 argi++;
             } else if (tryToParseFloatArg(args, &argi, "-uniformity", &uniformityWeight, &fail)) {
                 argi++;
@@ -390,69 +375,129 @@ int main(int argc, char** argv)
             }
         }
 
-        if (outputFileName.empty()) {
-            size_t      lastIndex      = albedoFileName.find_last_of(".");
-            std::string albedoBaseName = albedoFileName.substr(0, lastIndex);
-            outputFileName             = albedoBaseName + "_inpainted.png";
+        if (output_dir.empty()) {
+            output_dir = svbrdf_dir;
         }
+
+        auto it = svbrdf_dir.end() - 1;
+        if (*it == '/' || *it == '\\') {
+            svbrdf_dir.erase(it);
+        }
+        albedoFileName    = svbrdf_dir + "/albedo.png";
+        normalFileName    = svbrdf_dir + "/normal.png";
+        roughnessFileName = svbrdf_dir + "/roughness.png";
 
         if (fail) {
             return 1;
         }
     }
 
-    int            albedoWidth            = 0;
-    int            albedoHeight           = 0;
-    unsigned char* albedoData             = tryLoad(albedoFileName, &albedoWidth, &albedoHeight);
-    const int      numAlbedoChannelsTotal = evalNumChannels(albedoData, albedoWidth * albedoHeight);
+    int   numSVBRDFChannelsTotal = 0;
+    Image albedo;
+    albedo.data     = tryLoad(albedoFileName, &albedo.width, &albedo.height);
+    albedo.channels = evalNumChannels(albedo.data, albedo.width * albedo.height);
+    numSVBRDFChannelsTotal += albedo.channels;
+    svbrdfs.push_back(albedo);
+#ifndef EBSYNTH_ALBEDO_ONLY
+    Image normal;
+    normal.data     = tryLoad(normalFileName, &normal.width, &normal.height);
+    normal.channels = evalNumChannels(normal.data, normal.width * normal.height);
+    numSVBRDFChannelsTotal += normal.channels;
+    svbrdfs.push_back(normal);
 
-    std::vector<unsigned char> albedoSource;
-    compressImageData(albedoWidth, albedoHeight, numAlbedoChannelsTotal, albedoData, albedoSource);
-
-    int            maskWidth            = 0;
-    int            maskHeight           = 0;
-    unsigned char* maskData             = tryLoad(maskFileName, &maskWidth, &maskHeight);
-    const int      numMaskChannelsTotal = evalNumChannels(maskData, maskWidth * maskHeight);
-
-    if (albedoWidth != maskWidth || albedoHeight != maskHeight) {
-        printf("error: shape mismatch, source shape is %dx%dx%d, mask shape is %dx%dx%d\n", albedoWidth, albedoHeight, numAlbedoChannelsTotal, maskWidth, maskHeight, numMaskChannelsTotal);
-        return 1;
-    }
-    if (numAlbedoChannelsTotal > EBSYNTH_MAX_STYLE_CHANNELS) {
-        printf("error: too many style channels (%d), maximum number is %d\n", numAlbedoChannelsTotal, EBSYNTH_MAX_STYLE_CHANNELS);
-        return 1;
-    }
-    if (numMaskChannelsTotal > EBSYNTH_MAX_GUIDE_CHANNELS) {
-        printf("error: too many guide channels (%d), maximum number is %d\n", numMaskChannelsTotal, EBSYNTH_MAX_GUIDE_CHANNELS);
+    if (albedo.width != normal.width || albedo.height != normal.height) {
+        printf("error: shape mismatch, albedo shape is %dx%dx%d, normal shape is %dx%dx%d\n", albedo.width, albedo.height, albedo.channels, normal.width, normal.height, normal.channels);
         return 1;
     }
 
-    std::vector<unsigned char> maskSource;
-    std::vector<unsigned char> maskTarget;
-    compressImageData(maskWidth, maskHeight, numMaskChannelsTotal, maskData, maskTarget);
-    for (auto& pixel : maskTarget) {
-        maskSource.push_back(255 - pixel);
+    Image roughness;
+    roughness.data     = tryLoad(roughnessFileName, &roughness.width, &roughness.height);
+    roughness.channels = evalNumChannels(roughness.data, roughness.width * roughness.height);
+    numSVBRDFChannelsTotal += roughness.channels;
+    svbrdfs.push_back(roughness);
+
+    if (albedo.width != roughness.width || albedo.height != roughness.height) {
+        printf("error: shape mismatch, albedo shape is %dx%dx%d, normal shape is %dx%dx%d\n", albedo.width, albedo.height, albedo.channels, roughness.width, roughness.height, roughness.channels);
+        return 1;
+    }
+#endif
+    std::vector<unsigned char> sourceSVBRDF(albedo.width * albedo.height * numSVBRDFChannelsTotal);
+    for (int xy = 0; xy < albedo.width * albedo.height; xy++) {
+        int c = 0;
+        for (size_t i = 0; i < svbrdfs.size(); i++) {
+            const int channels = svbrdfs[i].channels;
+
+            if (channels > 0) {
+                sourceSVBRDF[xy * numSVBRDFChannelsTotal + c + 0] = svbrdfs[i].data[xy * 4 + 0];
+            }
+            if (channels == 2) {
+                sourceSVBRDF[xy * numSVBRDFChannelsTotal + c + 1] = svbrdfs[i].data[xy * 4 + 3];
+            } else if (channels > 1) {
+                sourceSVBRDF[xy * numSVBRDFChannelsTotal + c + 1] = svbrdfs[i].data[xy * 4 + 1];
+            }
+            if (channels > 2) {
+                sourceSVBRDF[xy * numSVBRDFChannelsTotal + c + 2] = svbrdfs[i].data[xy * 4 + 2];
+            }
+            if (channels > 3) {
+                sourceSVBRDF[xy * numSVBRDFChannelsTotal + c + 3] = svbrdfs[i].data[xy * 4 + 3];
+            }
+
+            c += channels;
+        }
     }
 
-    std::vector<float> albedoWeights(numAlbedoChannelsTotal);
-    if (albedoWeight < 0) {
-        albedoWeight = 1.0f;
+    Image mask;
+    mask.data     = tryLoad(maskFileName, &mask.width, &mask.height);
+    mask.channels = evalNumChannels(mask.data, mask.width * mask.height);
+
+    if (albedo.width != mask.width || albedo.height != mask.height) {
+        printf("error: shape mismatch, source shape is %dx%dx%d, mask shape is %dx%dx%d\n", albedo.width, albedo.height, albedo.channels, mask.width, mask.height, mask.channels);
+        return 1;
     }
-    for (int i = 0; i < numAlbedoChannelsTotal; i++) {
-        albedoWeights[i] = albedoWeight / float(numAlbedoChannelsTotal);
+    if (numSVBRDFChannelsTotal > EBSYNTH_MAX_STYLE_CHANNELS) {
+        printf("error: too many style channels (%d), maximum number is %d\n", numSVBRDFChannelsTotal, EBSYNTH_MAX_STYLE_CHANNELS);
+        return 1;
+    }
+    if (mask.channels > EBSYNTH_MAX_GUIDE_CHANNELS) {
+        printf("error: too many guide channels (%d), maximum number is %d\n", mask.channels, EBSYNTH_MAX_GUIDE_CHANNELS);
+        return 1;
     }
 
-    std::vector<float> maskWeights(numMaskChannelsTotal);
-    if (maskWeight < 0) {
-        maskWeight = 1.0f;
+    std::vector<unsigned char> targetMask(mask.width * mask.height * mask.channels);
+    for (int xy = 0; xy < mask.width * mask.height; xy++) {
+        if (mask.channels > 0) {
+            targetMask[xy * mask.channels + 0] = mask.data[xy * 4 + 0];
+        }
+        if (mask.channels == 2) {
+            targetMask[xy * mask.channels + 1] = mask.data[xy * 4 + 3];
+        } else if (mask.channels > 1) {
+            targetMask[xy * mask.channels + 1] = mask.data[xy * 4 + 1];
+        }
+        if (mask.channels > 2) {
+            targetMask[xy * mask.channels + 2] = mask.data[xy * 4 + 2];
+        }
+        if (mask.channels > 3) {
+            targetMask[xy * mask.channels + 3] = mask.data[xy * 4 + 3];
+        }
     }
-    for (int i = 0; i < numMaskChannelsTotal; i++) {
-        maskWeights[i] = maskWeight / float(numMaskChannelsTotal);
+    std::vector<unsigned char> sourceMask;
+    for (auto& pixel : targetMask) {
+        sourceMask.push_back(255 - pixel);
+    }
+
+    std::vector<float> svbrdfWeights(numSVBRDFChannelsTotal);
+    for (int i = 0; i < numSVBRDFChannelsTotal; i++) {
+        svbrdfWeights[i] = 1.0 / float(numSVBRDFChannelsTotal);
+    }
+
+    std::vector<float> maskWeights(mask.channels);
+    for (int i = 0; i < mask.channels; i++) {
+        maskWeights[i] = 1.0 / float(mask.channels);
     }
 
     int maxPyramidLevels = 0;
     for (int level = 32; level >= 0; level--) {
-        if (min(pyramidLevelSize(V2i(albedoWidth, albedoHeight), level)) >= (2 * patchSize + 1)) {
+        if (min(pyramidLevelSize(V2i(albedo.width, albedo.height), level)) >= (2 * patchSize + 1)) {
             maxPyramidLevels = level + 1;
             break;
         }
@@ -472,7 +517,7 @@ int main(int argc, char** argv)
         stopThresholdPerLevel[i]      = stopThreshold;
     }
 
-    std::vector<unsigned char> output(albedoWidth * albedoHeight * numAlbedoChannelsTotal);
+    std::vector<unsigned char> output(albedo.width * albedo.height * numSVBRDFChannelsTotal);
 
     printf("uniformity: %.0f\n", uniformityWeight);
     printf("patchsize: %d\n", patchSize);
@@ -484,21 +529,21 @@ int main(int argc, char** argv)
     printf("backend: %s\n", backendToString(backend).c_str());
 
     ebsynthRun(backend,
-               numAlbedoChannelsTotal,
-               numMaskChannelsTotal,
-               albedoWidth,
-               albedoHeight,
-               albedoSource.data(),
-               maskSource.data(),
-               maskWidth,
-               maskHeight,
-               maskTarget.data(),
+               numSVBRDFChannelsTotal,
+               mask.channels,
+               albedo.width,
+               albedo.height,
+               sourceSVBRDF.data(),
+               sourceMask.data(),
+               mask.width,
+               mask.height,
+               targetMask.data(),
                NULL,
-               albedoWeights.data(),
+               svbrdfWeights.data(),
                maskWeights.data(),
                uniformityWeight,
                patchSize,
-               EBSYNTH_VOTEMODE_PLAIN,
+               EBSYNTH_VOTEMODE_WEIGHTED,
                numPyramidLevels,
                numSearchVoteItersPerLevel.data(),
                numPatchMatchItersPerLevel.data(),
@@ -507,11 +552,46 @@ int main(int argc, char** argv)
                NULL,
                output.data());
 
-    stbi_write_png(outputFileName.c_str(), albedoWidth, albedoHeight, numAlbedoChannelsTotal, output.data(), numAlbedoChannelsTotal * albedoWidth);
+    auto it = output_dir.end() - 1;
+    if (*it == '/' || *it == '\\') {
+        output_dir.erase(it);
+    }
+    std::string albedoOutput    = output_dir + "/albedo_inpainted.png";
+    std::string normalOutput    = output_dir + "/normal_inpainted.png";
+    std::string roughnessOutput = output_dir + "/roughness_inpainted.png";
 
-    printf("result was written to %s\n", outputFileName.c_str());
+#ifndef EBSYNTH_ALBEDO_ONLY
+    std::vector<unsigned char> albedoData;
+    std::vector<unsigned char> normalData;
+    std::vector<unsigned char> roughnessData;
+    for (int xy = 0; xy < albedo.width * albedo.height; xy++) {
+        for (int i = 0; i < numSVBRDFChannelsTotal; i++) {
+            if (i < albedo.channels) {
+                albedoData.push_back(output[xy * numSVBRDFChannelsTotal + i]);
+            } else if (i < albedo.channels + normal.channels) {
+                normalData.push_back(output[xy * numSVBRDFChannelsTotal + i]);
+            } else {
+                roughnessData.push_back(output[xy * numSVBRDFChannelsTotal + i]);
+            }
+        }
+    }
 
-    stbi_image_free(albedoData);
-    stbi_image_free(maskData);
+    stbi_write_png(albedoOutput.c_str(), albedo.width, albedo.height, albedo.channels, albedoData.data(), albedo.channels * albedo.width);
+    stbi_write_png(normalOutput.c_str(), normal.width, normal.height, normal.channels, normalData.data(), normal.channels * normal.width);
+    stbi_write_png(roughnessOutput.c_str(), roughness.width, roughness.height, roughness.channels, roughnessData.data(), roughness.channels * roughness.width);
+
+    printf("albedo was written to %s\n", albedoOutput.c_str());
+    printf("normal was written to %s\n", normalOutput.c_str());
+    printf("roughness was written to %s\n", roughnessOutput.c_str());
+#else
+    stbi_write_png(albedoOutput.c_str(), albedo.width, albedo.height, albedo.channels, output.data(), albedo.channels * albedo.width);
+
+    printf("albedo was written to %s\n", albedoOutput.c_str());
+#endif
+
+    for (size_t i = 0; i < svbrdfs.size(); i++) {
+        stbi_image_free(svbrdfs[i].data);
+    }
+    stbi_image_free(mask.data);
     return 0;
 }

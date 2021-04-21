@@ -450,6 +450,7 @@ __global__ void krnlVotePlain(      TexArray2<N,T,M> target,
 template<int N, typename T, int M>
 __global__ void krnlVoteWeighted(      TexArray2<N,T,M>   target,
                                  const TexArray2<N,T,M>   source,
+                                 const TexArray2<1, unsigned char> mask,
                                  const TexArray2<2,int>   NNF,
                                  const TexArray2<1,float> E,
                                  const int patchSize)
@@ -457,7 +458,7 @@ __global__ void krnlVoteWeighted(      TexArray2<N,T,M>   target,
   const int x = blockDim.x*blockIdx.x + threadIdx.x;
   const int y = blockDim.y*blockIdx.y + threadIdx.y;
 
-  if (x<target.width && y<target.height)
+  if (x<target.width && y<target.height && mask(x,y)[0] == 255)
   {
     const int r = patchSize / 2;
 
@@ -820,18 +821,6 @@ void ebsynthCuda(int    numStyleChannels,
   copy(&pyramid[levelCount-1].sourceGuide,sourceGuideData);
   copy(&pyramid[levelCount-1].targetGuide,targetGuideData);
   copy(&pyramid[levelCount-1].mask,sourceGuideData);
-  /*
-  {
-    const int numThreadsPerBlock = 24;
-    const dim3 threadsPerBlock = dim3(numThreadsPerBlock,numThreadsPerBlock);
-    const dim3 numBlocks = dim3((pyramid[levelCount-1].targetWidth+threadsPerBlock.x)/threadsPerBlock.x,
-                                (pyramid[levelCount-1].targetHeight+threadsPerBlock.y)/threadsPerBlock.y);
-    krnlDilateMask<<<numBlocks,threadsPerBlock>>>(pyramid[levelCount-1].mask2,
-                                                  pyramid[levelCount-1].mask,
-                                                  patchSize);
-    std::swap(pyramid[levelCount-1].mask2,pyramid[levelCount-1].mask);
-  }
-  */
 
   if (targetModulationData)
   {
@@ -1074,6 +1063,7 @@ void ebsynthCuda(int    numStyleChannels,
         {
           krnlVoteWeighted<<<numBlocks,threadsPerBlock>>>(pyramid[level].targetStyle2,
                                                           pyramid[level].sourceStyle,
+                                                          pyramid[level].mask,
                                                           pyramid[level].NNF,
                                                           pyramid[level].E,
                                                           patchSize);
@@ -1130,6 +1120,7 @@ void ebsynthCuda(int    numStyleChannels,
       level--;
       patchSize = 3;
       uniformityWeight = 0;
+      copy(&pyramid[levelCount-1].mask,sourceGuideData);
     }
   }
 

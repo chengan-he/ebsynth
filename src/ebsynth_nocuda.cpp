@@ -25,10 +25,9 @@ void ebsynthRunCuda(int    numStyleChannels,
                     void*  outputNnfData,
                     void*  outputImageData)
 {
-
 }
 
 int ebsynthBackendAvailableCuda()
 {
-  return 0;
+    return 0;
 }

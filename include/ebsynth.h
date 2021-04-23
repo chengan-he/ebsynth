@@ -27,7 +27,7 @@ extern "C" {
 #define EBSYNTH_VOTEMODE_PLAIN 0x0001 // weight = 1
 #define EBSYNTH_VOTEMODE_WEIGHTED 0x0002 // weight = 1/(1+error)
 
-// #define EBSYNTH_ALBEDO_ONLY
+#define EBSYNTH_ALBEDO_ONLY
 
 EBSYNTH_API
 int ebsynthBackendAvailable(int ebsynthBackend); // returns non-zero if the specified backend is available

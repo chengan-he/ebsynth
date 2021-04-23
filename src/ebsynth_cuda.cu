@@ -80,6 +80,7 @@ template<typename FUNC>
 __global__ void krnlEvalErrorPass(const int patchWidth,
                                   FUNC patchError,
                                   const TexArray2<2,int> NNF,
+                                  const TexArray2<1,unsigned char> mask,
                                   TexArray2<1,float> E)
 {
   const int x = blockDim.x*blockIdx.x + threadIdx.x;
@@ -87,8 +88,15 @@ __global__ void krnlEvalErrorPass(const int patchWidth,
 
   if (x<NNF.width && y<NNF.height)
   {
-    const V2i n = NNF(x,y);
-    E.write(x,y,V1f(patchError(patchWidth,x,y,n[0],n[1],FLT_MAX)));
+    if (mask(x,y)[0] == 255)
+    {
+      const V2i n = NNF(x,y);
+      E.write(x,y,V1f(patchError(patchWidth,x,y,n[0],n[1],FLT_MAX)));
+    }
+    else
+    {
+      E.write(x,y,V1f(0.0)); 
+    }
   }
 }
 
@@ -325,7 +333,7 @@ void patchmatchGPU(const V2i sizeA,
   const dim3 numBlocks = dim3((NNF.width+threadsPerBlock.x)/threadsPerBlock.x,
                               (NNF.height+threadsPerBlock.y)/threadsPerBlock.y);
 
-  krnlEvalErrorPass<<<numBlocks,threadsPerBlock>>>(patchWidth,patchError,NNF,E);
+  krnlEvalErrorPass<<<numBlocks,threadsPerBlock>>>(patchWidth,patchError,NNF,mask,E);
 
   checkCudaError(cudaDeviceSynchronize());
 
@@ -351,41 +359,56 @@ void patchmatchGPU(const V2i sizeA,
     checkCudaError(cudaDeviceSynchronize());
   }
 
-  krnlEvalErrorPass<<<numBlocks,threadsPerBlock>>>(patchWidth,patchError,NNF,E);
+  krnlEvalErrorPass<<<numBlocks,threadsPerBlock>>>(patchWidth,patchError,NNF,mask,E);
 
   checkCudaError(cudaDeviceSynchronize());
 }
 
 static A2V2i nnfInitRandom(const V2i& targetSize,
-                    const V2i& sourceSize,
-                    const int  patchSize)
+                           const V2i& sourceSize,
+                           const int  patchSize,
+                           unsigned char* mask)
 {
   A2V2i NNF(targetSize);
   const int r = patchSize/2;
 
   for (int i = 0; i < NNF.numel(); i++)
-  {
-      NNF[i] = V2i
-      (
-          r+(rand()%(sourceSize[0]-2*r)),
-          r+(rand()%(sourceSize[1]-2*r))
-      );
+  {   
+      int x = i % sourceSize[0];
+      int y = i / sourceSize[0];
+      if (mask[y * sourceSize[0]+x] == 255)
+      {
+        do {
+            x = r+(rand()%(sourceSize[0]-2*r));
+            y = r+(rand()%(sourceSize[1]-2*r));
+        } while (mask[y*sourceSize[0]+x] == 255);
+      }
+      NNF[i] = V2i(clamp(x, r, sourceSize(0)-r-1),
+                   clamp(y, r, sourceSize(1)-r-1));
   }
 
   return NNF;
 }
 
 static A2V2i nnfUpscale(const A2V2i& NNF,
-                 const int    patchSize,
-                 const V2i&   targetSize,
-                 const V2i&   sourceSize)
+                        const int    patchSize,
+                        const V2i&   targetSize,
+                        const V2i&   sourceSize,
+                        unsigned char* mask)
 {
   A2V2i NNF2x(targetSize);
 
   FOR(NNF2x,x,y)
   {
-    NNF2x(x,y) = NNF(clamp(x/2,0,NNF.width()-1),
-                     clamp(y/2,0,NNF.height()-1))*2+V2i(x%2,y%2);
+    if (mask[y * sourceSize[0]+x] == 255)
+    {
+      NNF2x(x,y) = NNF(clamp(x/2,0,NNF.width()-1),
+                       clamp(y/2,0,NNF.height()-1))*2+V2i(x%2,y%2);
+    }
+    else
+    {
+      NNF2x(x,y) = V2i(x,y);
+    }
   }
 
   FOR(NNF2x,x,y)
@@ -402,7 +425,7 @@ static A2V2i nnfUpscale(const A2V2i& NNF,
 template<int N, typename T, int M>
 __global__ void krnlVotePlain(      TexArray2<N,T,M> target,
                               const TexArray2<N,T,M> source,
-                              const TexArray2<1, unsigned char> mask,
+                              const TexArray2<1,unsigned char> mask,
                               const TexArray2<2,int> NNF,
                               const int              patchSize)
 {
@@ -450,7 +473,7 @@ __global__ void krnlVotePlain(      TexArray2<N,T,M> target,
 template<int N, typename T, int M>
 __global__ void krnlVoteWeighted(      TexArray2<N,T,M>   target,
                                  const TexArray2<N,T,M>   source,
-                                 const TexArray2<1, unsigned char> mask,
+                                 const TexArray2<1,unsigned char> mask,
                                  const TexArray2<2,int>   NNF,
                                  const TexArray2<1,float> E,
                                  const int patchSize)
@@ -554,8 +577,8 @@ __global__ void krnlEvalMask(      TexArray2<1,unsigned char> mask,
   }
 }
 
-__global__ void krnlBinarizeMask(TexArray2<1, unsigned char> mask2,
-                                 const TexArray2<1, unsigned char> mask)
+__global__ void krnlBinarizeMask(TexArray2<1,unsigned char> mask2,
+                                 const TexArray2<1,unsigned char> mask)
 {
   const int x = blockDim.x*blockIdx.x + threadIdx.x;
   const int y = blockDim.y*blockIdx.y + threadIdx.y;
@@ -587,6 +610,25 @@ __global__ void krnlDilateMask(TexArray2<1,unsigned char> mask2,
     }
 
     mask2.write(x,y,msk);
+  }
+}
+
+template<int N, typename T, int M>
+__global__ void krnlMaskSource(      TexArray2<N,T,M> O,
+                               const TexArray2<N,T,M> I,
+                               const TexArray2<1,unsigned char> mask)
+{
+  const int x = blockDim.x*blockIdx.x + threadIdx.x;
+  const int y = blockDim.y*blockIdx.y + threadIdx.y;
+
+  if (x<O.width && y<O.height)
+  {
+    if (mask(x,y)[0]==255) 
+    {
+      O.write(x,y, Vec<N,T>(0));
+    } else {
+      O.write(x,y,I(x,y));
+    }
   }
 }
 
@@ -786,6 +828,7 @@ void ebsynthCuda(int    numStyleChannels,
     int targetHeight;
 
     TexArray2<NS,unsigned char> sourceStyle;
+    TexArray2<NS,unsigned char> sourceStyleMasked;
     TexArray2<NG,unsigned char> sourceGuide;
     TexArray2<NS,unsigned char> targetStyle;
     TexArray2<NS,unsigned char> targetStyle2;
@@ -811,16 +854,52 @@ void ebsynthCuda(int    numStyleChannels,
     pyramid[level].targetHeight = levelTargetSize(1);
   }
 
-  pyramid[levelCount-1].sourceStyle  = TexArray2<NS,unsigned char>(V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight));
-  pyramid[levelCount-1].sourceGuide  = TexArray2<NG,unsigned char>(V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight));
-  pyramid[levelCount-1].targetGuide  = TexArray2<NG,unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
-  pyramid[levelCount-1].mask         = TexArray2<1, unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
-  pyramid[levelCount-1].mask2        = TexArray2<1, unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+  pyramid[levelCount-1].sourceStyle       = TexArray2<NS,unsigned char>(V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight));
+  pyramid[levelCount-1].sourceStyleMasked = TexArray2<NS,unsigned char>(V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight));
+  pyramid[levelCount-1].sourceGuide       = TexArray2<NG,unsigned char>(V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight));
+  pyramid[levelCount-1].targetGuide       = TexArray2<NG,unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+  pyramid[levelCount-1].mask              = TexArray2<1, unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+  pyramid[levelCount-1].mask2             = TexArray2<1, unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
 
   copy(&pyramid[levelCount-1].sourceStyle,sourceStyleData);
   copy(&pyramid[levelCount-1].sourceGuide,sourceGuideData);
   copy(&pyramid[levelCount-1].targetGuide,targetGuideData);
   copy(&pyramid[levelCount-1].mask,sourceGuideData);
+  /*
+  {
+    const int numThreadsPerBlock = 24;
+    const dim3 threadsPerBlock = dim3(numThreadsPerBlock,numThreadsPerBlock);
+    const dim3 numBlocks = dim3((pyramid[levelCount-1].sourceWidth+threadsPerBlock.x)/threadsPerBlock.x,
+                                (pyramid[levelCount-1].sourceHeight+threadsPerBlock.y)/threadsPerBlock.y);
+    krnlBinarizeMask<<<numBlocks,threadsPerBlock>>>(pyramid[levelCount-1].mask2,pyramid[levelCount-1].mask);
+    std::swap(pyramid[levelCount-1].mask2,pyramid[levelCount-1].mask);
+    checkCudaError( cudaDeviceSynchronize() );
+    krnlMaskSource<<<numBlocks,threadsPerBlock>>>(pyramid[levelCount-1].sourceStyleMasked,pyramid[levelCount-1].sourceStyle,pyramid[levelCount-1].mask);
+    checkCudaError( cudaDeviceSynchronize() );
+    unsigned char* maskData = (unsigned char*)malloc(sizeof(unsigned char) * pyramid[levelCount-1].sourceWidth * pyramid[levelCount-1].sourceHeight);
+    copy((void**)&maskData, pyramid[levelCount-1].mask);
+    A2V2i cpu_NNF = nnfInitRandom(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight),
+                                  V2i(pyramid[levelCount-1].sourceWidth,pyramid[levelCount-1].sourceHeight),
+                                  patchSize,
+                                  maskData);
+    free(maskData);
+    pyramid[levelCount-1].targetStyle  = TexArray2<NS,unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+    pyramid[levelCount-1].targetStyle2 = TexArray2<NS,unsigned char>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+    pyramid[levelCount-1].NNF          = TexArray2<2,int>(V2i(pyramid[levelCount-1].targetWidth,pyramid[levelCount-1].targetHeight));
+    copy(&pyramid[levelCount-1].NNF,cpu_NNF);
+    resampleGPU(pyramid[levelCount-1].targetStyle2, pyramid[levelCount-1].sourceStyle);
+    krnlVotePlain<<<numBlocks,threadsPerBlock>>>(pyramid[levelCount-1].targetStyle2,
+                                                 pyramid[levelCount-1].sourceStyleMasked,
+                                                 pyramid[levelCount-1].mask,
+                                                 pyramid[levelCount-1].NNF,
+                                                 patchSize);
+
+    std::swap(pyramid[levelCount-1].targetStyle2,pyramid[levelCount-1].targetStyle)
+    checkCudaError( cudaDeviceSynchronize() );
+    copy(&outputImageData,pyramid[levelCount-1].targetStyle);
+    return;
+  }
+  */
 
   if (targetModulationData)
   {
@@ -836,6 +915,7 @@ void ebsynthCuda(int    numStyleChannels,
 
   for (int level=0;level<pyramid.size();level++)
   {
+    printf("Processing level %d: %dx%d\n", level, pyramid[level].sourceWidth, pyramid[level].sourceHeight);
     if (!inExtraPass)
     {
       const V2i levelSourceSize = V2i(pyramid[level].sourceWidth,pyramid[level].sourceHeight);
@@ -843,8 +923,6 @@ void ebsynthCuda(int    numStyleChannels,
 
       pyramid[level].targetStyle  = TexArray2<NS,unsigned char>(levelTargetSize);
       pyramid[level].targetStyle2 = TexArray2<NS,unsigned char>(levelTargetSize);
-      // pyramid[level].mask         = TexArray2<1,unsigned char>(levelTargetSize);
-      // pyramid[level].mask2        = TexArray2<1,unsigned char>(levelTargetSize);
       pyramid[level].NNF          = TexArray2<2,int>(levelTargetSize);
       pyramid[level].NNF2         = TexArray2<2,int>(levelTargetSize);
       pyramid[level].Omega        = MemArray2<int>(levelSourceSize);
@@ -852,25 +930,17 @@ void ebsynthCuda(int    numStyleChannels,
    
       if (level<levelCount-1)
       {
-        pyramid[level].sourceStyle  = TexArray2<NS,unsigned char>(levelSourceSize);
-        pyramid[level].sourceGuide  = TexArray2<NG,unsigned char>(levelSourceSize);
-        pyramid[level].targetGuide  = TexArray2<NG,unsigned char>(levelTargetSize);
-        pyramid[level].mask         = TexArray2<1,unsigned char>(levelTargetSize);
-        pyramid[level].mask2        = TexArray2<1,unsigned char>(levelTargetSize);
+        pyramid[level].sourceStyle       = TexArray2<NS,unsigned char>(levelSourceSize);
+        pyramid[level].sourceStyleMasked = TexArray2<NS,unsigned char>(levelSourceSize);
+        pyramid[level].sourceGuide       = TexArray2<NG,unsigned char>(levelSourceSize);
+        pyramid[level].targetGuide       = TexArray2<NG,unsigned char>(levelTargetSize);
+        pyramid[level].mask              = TexArray2<1,unsigned char>(levelSourceSize);
+        pyramid[level].mask2             = TexArray2<1,unsigned char>(levelSourceSize);
 
         resampleGPU(pyramid[level].sourceStyle,pyramid[levelCount-1].sourceStyle);
         resampleGPU(pyramid[level].sourceGuide,pyramid[levelCount-1].sourceGuide);
         resampleGPU(pyramid[level].targetGuide,pyramid[levelCount-1].targetGuide);
         resampleGPU(pyramid[level].mask,pyramid[levelCount-1].mask);
-        {
-          const int numThreadsPerBlock = 24;
-          const dim3 threadsPerBlock = dim3(numThreadsPerBlock,numThreadsPerBlock);
-          const dim3 numBlocks = dim3((pyramid[level].targetWidth+threadsPerBlock.x)/threadsPerBlock.x,
-                                      (pyramid[level].targetHeight+threadsPerBlock.y)/threadsPerBlock.y);
-          krnlBinarizeMask<<<numBlocks,threadsPerBlock>>>(pyramid[level].mask2,pyramid[level].mask);
-          std::swap(pyramid[level].mask2,pyramid[level].mask);
-          checkCudaError( cudaDeviceSynchronize() );
-        }
 
         if (targetModulationData)
         {
@@ -879,7 +949,21 @@ void ebsynthCuda(int    numStyleChannels,
         }
       }
 
+      {
+        const int numThreadsPerBlock = 24;
+        const dim3 threadsPerBlock = dim3(numThreadsPerBlock,numThreadsPerBlock);
+        const dim3 numBlocks = dim3((pyramid[level].sourceWidth+threadsPerBlock.x)/threadsPerBlock.x,
+                                    (pyramid[level].sourceHeight+threadsPerBlock.y)/threadsPerBlock.y);
+        krnlBinarizeMask<<<numBlocks,threadsPerBlock>>>(pyramid[level].mask2,pyramid[level].mask);
+        std::swap(pyramid[level].mask2,pyramid[level].mask);
+        checkCudaError( cudaDeviceSynchronize() );
+        krnlMaskSource<<<numBlocks,threadsPerBlock>>>(pyramid[level].sourceStyleMasked,pyramid[level].sourceStyle,pyramid[level].mask);
+        checkCudaError( cudaDeviceSynchronize() );
+      }
+
       A2V2i cpu_NNF;
+      unsigned char* maskData = (unsigned char*)malloc(sizeof(unsigned char) * pyramid[level].sourceWidth * pyramid[level].sourceHeight);
+      copy((void**)&maskData, pyramid[level].mask);
       if (level>0)
       {
         A2V2i prevLevelNNF(pyramid[level-1].targetWidth,
@@ -890,7 +974,8 @@ void ebsynthCuda(int    numStyleChannels,
         cpu_NNF = nnfUpscale(prevLevelNNF,
                              patchSize,
                              V2i(pyramid[level].targetWidth,pyramid[level].targetHeight),
-                             V2i(pyramid[level].sourceWidth,pyramid[level].sourceHeight));
+                             V2i(pyramid[level].sourceWidth,pyramid[level].sourceHeight),
+                             maskData);
         
         pyramid[level-1].NNF.destroy();
       }
@@ -898,9 +983,11 @@ void ebsynthCuda(int    numStyleChannels,
       {
         cpu_NNF = nnfInitRandom(V2i(pyramid[level].targetWidth,pyramid[level].targetHeight),
                                 V2i(pyramid[level].sourceWidth,pyramid[level].sourceHeight),
-                                patchSize);
+                                patchSize,
+                                maskData);
       }
       copy(&pyramid[level].NNF,cpu_NNF);
+      free(maskData);
 
       /////////////////////////////////////////////////////////////////////////
       Array2<int> cpu_Omega(pyramid[level].sourceWidth,pyramid[level].sourceHeight);
@@ -937,7 +1024,7 @@ void ebsynthCuda(int    numStyleChannels,
       
       resampleGPU(pyramid[level].targetStyle2, pyramid[level].sourceStyle);
       krnlVotePlain<<<numBlocks,threadsPerBlock>>>(pyramid[level].targetStyle2,
-                                                   pyramid[level].sourceStyle,
+                                                   pyramid[level].sourceStyleMasked,
                                                    pyramid[level].mask,
                                                    pyramid[level].NNF,
                                                    patchSize);
@@ -1028,6 +1115,7 @@ void ebsynthCuda(int    numStyleChannels,
                                                                                                           styleWeightsVec,
                                                                                                           guideWeightsVec),
                                                            pyramid[level].NNF,
+                                                           pyramid[level].mask,
                                                            pyramid[level].E);
         }
         else
@@ -1040,6 +1128,7 @@ void ebsynthCuda(int    numStyleChannels,
                                                                                                styleWeightsVec,
                                                                                                guideWeightsVec),
                                                            pyramid[level].NNF,
+                                                           pyramid[level].mask,
                                                            pyramid[level].E);
         }
         checkCudaError( cudaDeviceSynchronize() );
@@ -1079,7 +1168,6 @@ void ebsynthCuda(int    numStyleChannels,
                                                       pyramid[level].targetStyle2,
                                                       stopThresholdPerLevel[level]);
           checkCudaError( cudaDeviceSynchronize() );
-          
           /*
           krnlDilateMask<<<numBlocks,threadsPerBlock>>>(pyramid[level].mask2,
                                                         pyramid[level].mask,
@@ -1102,6 +1190,7 @@ void ebsynthCuda(int    numStyleChannels,
         (extraPass3x3!=0 && inExtraPass))
     {
       pyramid[level].sourceStyle.destroy();
+      pyramid[level].sourceStyleMasked.destroy();
       pyramid[level].sourceGuide.destroy();
       pyramid[level].targetGuide.destroy();
       pyramid[level].targetStyle.destroy();

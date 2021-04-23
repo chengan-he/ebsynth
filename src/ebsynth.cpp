@@ -287,11 +287,12 @@ int main(int argc, char** argv)
     std::string        maskFileName;
 
     float uniformityWeight   = 3500;
+    float maskWeight         = 1.0;
     int   patchSize          = 5;
     int   numPyramidLevels   = -1;
     int   numSearchVoteIters = 6;
     int   numPatchMatchIters = 4;
-    int   stopThreshold      = 5;
+    int   stopThreshold      = 1;
     int   extraPass3x3       = 0;
     int   backend            = ebsynthBackendAvailable(EBSYNTH_BACKEND_CUDA) ? EBSYNTH_BACKEND_CUDA : EBSYNTH_BACKEND_CPU;
 
@@ -313,6 +314,8 @@ int main(int argc, char** argv)
             } else if (tryToParseStringArg(args, &argi, "-output_dir", &output_dir, &fail)) {
                 argi++;
             } else if (tryToParseStringArg(args, &argi, "-mask", &maskFileName, &fail)) {
+                argi++;
+            } else if (tryToParseFloatArg(args, &argi, "-weight", &maskWeight, &fail)) {
                 argi++;
             } else if (tryToParseFloatArg(args, &argi, "-uniformity", &uniformityWeight, &fail)) {
                 argi++;
@@ -463,26 +466,26 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::vector<unsigned char> targetMask(mask.width * mask.height * mask.channels);
+    std::vector<unsigned char> sourceMask(mask.width * mask.height * mask.channels);
     for (int xy = 0; xy < mask.width * mask.height; xy++) {
         if (mask.channels > 0) {
-            targetMask[xy * mask.channels + 0] = mask.data[xy * 4 + 0];
+            sourceMask[xy * mask.channels + 0] = mask.data[xy * 4 + 0];
         }
         if (mask.channels == 2) {
-            targetMask[xy * mask.channels + 1] = mask.data[xy * 4 + 3];
+            sourceMask[xy * mask.channels + 1] = mask.data[xy * 4 + 3];
         } else if (mask.channels > 1) {
-            targetMask[xy * mask.channels + 1] = mask.data[xy * 4 + 1];
+            sourceMask[xy * mask.channels + 1] = mask.data[xy * 4 + 1];
         }
         if (mask.channels > 2) {
-            targetMask[xy * mask.channels + 2] = mask.data[xy * 4 + 2];
+            sourceMask[xy * mask.channels + 2] = mask.data[xy * 4 + 2];
         }
         if (mask.channels > 3) {
-            targetMask[xy * mask.channels + 3] = mask.data[xy * 4 + 3];
+            sourceMask[xy * mask.channels + 3] = mask.data[xy * 4 + 3];
         }
     }
-    std::vector<unsigned char> sourceMask;
-    for (auto& pixel : targetMask) {
-        sourceMask.push_back(255 - pixel);
+    std::vector<unsigned char> targetMask;
+    for (auto& pixel : sourceMask) {
+        targetMask.push_back(255 - pixel);
     }
 
     std::vector<float> svbrdfWeights(numSVBRDFChannelsTotal);
@@ -492,7 +495,7 @@ int main(int argc, char** argv)
 
     std::vector<float> maskWeights(mask.channels);
     for (int i = 0; i < mask.channels; i++) {
-        maskWeights[i] = 1.0 / float(mask.channels);
+        maskWeights[i] = maskWeight / float(mask.channels);
     }
 
     int maxPyramidLevels = 0;
@@ -519,7 +522,8 @@ int main(int argc, char** argv)
 
     std::vector<unsigned char> output(albedo.width * albedo.height * numSVBRDFChannelsTotal);
 
-    printf("uniformity: %.0f\n", uniformityWeight);
+    printf("uniformity: %.1f\n", uniformityWeight);
+    printf("weight: %.1f\n", maskWeight);
     printf("patchsize: %d\n", patchSize);
     printf("pyramidlevels: %d\n", numPyramidLevels);
     printf("searchvoteiters: %d\n", numSearchVoteIters);

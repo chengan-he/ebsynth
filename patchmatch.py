@@ -1,6 +1,7 @@
 import ctypes
 import os.path as pth
 import numpy as np
+import cv2
 
 PMLIB = ctypes.CDLL(pth.join(pth.dirname(__file__), 'bin', 'ebsynth'))
 
@@ -54,7 +55,7 @@ def inpaint(image: np.ndarray, mask: np.ndarray, weight=1, uniformity=3500, patc
 
     Args:
         image ([h*w*c] np.ndarray): the input image, can be either greyscale, RGB or stacked SVBRDF
-        mask ([h*w*1] np.ndarray): the mask of the hole to be filled
+        mask ([h*w*1] np.ndarray): the mask of the hole to be filled (black pixels are the missing area and white pixels are the valid area)
 
     Returns:
         output ([h*w*c] np.ndarray): the inpainted image, of the same size as the input image
@@ -65,11 +66,20 @@ def inpaint(image: np.ndarray, mask: np.ndarray, weight=1, uniformity=3500, patc
         raise NotImplementedError('CUDA is required to execute the PatchMatch algorithm')
 
     image_height, image_width, image_channel = image.shape
+    input_dtype = image.dtype
     mask_height, mask_width, mask_channel = mask.shape
 
+    if input_dtype != np.uint8:
+        image = (np.clip(image, 0, 1) * 255.0).astype(np.uint8)
+    if mask.dtype != np.uint8:
+        mask = (np.clip(mask, 0, 1) * 255.0).astype(np.uint8)
+
+    discard_edges = int(0.05 * min(mask_width, mask_height))  # 0.01 or 0.02
+    eroded_mask = cv2.erode(mask, np.ones((discard_edges, discard_edges), dtype=np.uint8), iterations=1)
+
     image_data = image.flatten()
-    mask_data = mask.flatten()
-    inv_mask_data = np.invert(mask_data)
+    inv_mask_data = eroded_mask.flatten()
+    mask_data = np.invert(inv_mask_data)
 
     image_weights = [1.0 / image_channel for _ in range(image_channel)]
     image_weights_array = (ctypes.c_float*len(image_weights))(*image_weights)
@@ -128,5 +138,8 @@ def inpaint(image: np.ndarray, mask: np.ndarray, weight=1, uniformity=3500, patc
                None,
                output_data.ctypes.data_as(ctypes.c_void_p)
                )
+
+    if input_dtype != np.uint8:
+        output_data = (output_data/255.0).astype(input_dtype)
 
     return output_data.reshape((image_height, image_width, image_channel))
